@@ -127,6 +127,9 @@ export function useGame() {
    * @param {boolean[]} isAI - Tableau indiquant si chaque joueur est une IA
    */
   function initGame(playerNames, isAI = []) {
+    // Normalise isAI: accepte un tableau plain ou un ref Vue
+    const isAIArray = Array.isArray(isAI) ? isAI : (isAI?.value ?? [])
+
     // 1. Créer et mélanger toutes les cartes
     const allCards = []
     for (let i = CARD_MIN; i <= CARD_MAX; i++) allCards.push(i)
@@ -141,27 +144,27 @@ export function useGame() {
     // 4. Créer les joueurs
     players.value = playerNames.map((name, i) => ({
       id: i,
-      name,
-      isAI: isAI[i] || false,
+      name: name || 'Joueur ' + (i + 1),
+      isAI: isAIArray[i] === true,
       cartes: [],
       jetons: TOKENS_PER_PLAYER,
     }))
 
-    // 5. Initialiser l'état
+    // 5. Initialiser l'état AVANT de passer en 'playing'
     deck.value = allCards
+    currentCard.value = null
     tokensOnCard.value = 0
     currentPlayerIndex.value = 0
     lastAction.value = null
     cardAnimKey.value = 0
 
-    // 6. Révéler la première carte
-    _revealNextCard()
-
+    // 6. Phase playing d'abord, puis révéler la carte (laisse Vue mettre à jour le DOM)
     phase.value = 'playing'
-    _saveToStorage()
-
-    // 7. Si le premier joueur est une IA, la faire jouer après un délai
-    _scheduleAITurn()
+    setTimeout(() => {
+      _revealNextCard()
+      _saveToStorage()
+      _scheduleAITurn()
+    }, 50)
   }
 
   /** Révèle la prochaine carte de la pioche. */

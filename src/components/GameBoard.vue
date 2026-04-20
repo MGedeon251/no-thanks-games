@@ -1,35 +1,31 @@
 <template>
-  <!--
-    GameBoard : plateau de jeu principal.
-    Compose CardPile, Controls et PlayerPanel en une mise en page centrée.
-  -->
   <div class="min-h-screen flex flex-col items-center px-4 py-6 gap-6">
 
-    <!-- En-tête : titre + infos de partie -->
+    <!-- En-tête -->
     <header class="w-full max-w-5xl flex items-center justify-between">
       <h1 class="font-display text-2xl md:text-3xl text-gold tracking-tight">
         No <span class="italic">Thanks!</span>
       </h1>
       <div class="flex items-center gap-4 text-sm text-felt-light font-body">
         <span class="font-mono">
-          {{ deck.length + 1 }} carte{{ deck.length + 1 !== 1 ? 's' : '' }} restante{{ deck.length + 1 !== 1 ? 's' : '' }}
+          {{ deck.length + 1 }} {{ t('game.cards_left', deck.length + 1) }}
         </span>
         <button
           class="text-xs px-3 py-1 rounded-lg border border-token-gold/30 text-gold/70 hover:text-gold hover:border-token-gold/60 transition-colors"
           @click="$emit('quit')"
         >
-          Quitter
+          {{ t('game.quit_btn') }}
         </button>
       </div>
     </header>
 
-    <!-- Corps principal : plateau + joueurs -->
+    <!-- Corps -->
     <main class="w-full max-w-5xl flex flex-col lg:flex-row gap-6 flex-1">
 
-      <!-- Colonne centrale : carte + action -->
+      <!-- Colonne centrale -->
       <div class="flex flex-col items-center gap-8 flex-1">
 
-        <!-- Notification dernière action -->
+        <!-- Toast dernière action -->
         <Transition name="action-toast">
           <div
             v-if="lastAction"
@@ -41,11 +37,11 @@
               {{ lastAction.playerName }}
             </span>
             <span class="text-felt-light mx-1">
-              {{ lastAction.type === 'take' ? 'a pris la carte' : 'a dit No Thanks!' }}
+              {{ lastAction.type === 'take' ? t('game.action_took') : t('game.action_refused') }}
             </span>
             <span class="text-gold font-mono">{{ lastAction.card }}</span>
             <span v-if="lastAction.type === 'take' && lastAction.tokens > 0" class="text-gold ml-1">
-              (+{{ lastAction.tokens }} jetons)
+              (+{{ lastAction.tokens }} {{ t('game.tokens_gained') }})
             </span>
           </div>
         </Transition>
@@ -60,32 +56,34 @@
           />
         </div>
 
-        <!-- Séparateur décoratif -->
+        <!-- Séparateur -->
         <div class="w-full flex items-center gap-3">
           <div class="h-px flex-1 bg-gradient-to-r from-transparent via-token-gold/30 to-transparent" />
           <div class="token small opacity-60" />
           <div class="h-px flex-1 bg-gradient-to-r from-transparent via-token-gold/30 to-transparent" />
         </div>
 
-        <!-- Contrôles du joueur actif -->
+        <!-- Contrôles -->
         <Controls
           :player-name="currentPlayer.name"
           :player-tokens="currentPlayer.jetons"
           :is-a-i="currentPlayer.isAI"
           :disabled="currentPlayer.isAI"
           :shake="noTokenShake"
+          :timer-enabled="timerEnabled"
+          :remaining="remaining"
+          :progress="progress"
+          :urgency="urgency"
           @take="$emit('take')"
           @refuse="$emit('refuse')"
         />
-
       </div>
 
-      <!-- Colonne droite : panneau des joueurs -->
+      <!-- Colonne droite : joueurs -->
       <aside class="w-full lg:w-72 xl:w-80 flex flex-col gap-3">
         <h2 class="text-xs uppercase tracking-widest text-felt-light font-body mb-1 px-1">
-          Joueurs
+          {{ t('game.players_title') }}
         </h2>
-
         <PlayerPanel
           v-for="(player, i) in players"
           :key="player.id"
@@ -94,11 +92,9 @@
           :score="liveScores.find(s => s.id === player.id)?.score ?? 0"
           :sequences="liveScores.find(s => s.id === player.id)?.sequences ?? []"
         />
-
-        <!-- Légende séquences -->
         <div class="panel px-3 py-2 text-xs text-felt-light flex items-start gap-2 mt-1">
           <span class="text-token-gold">ℹ</span>
-          <span>Les cartes consécutives forment une séquence : seule la plus petite compte dans le score.</span>
+          <span>{{ t('game.seq_hint') }}</span>
         </div>
       </aside>
 
@@ -107,37 +103,36 @@
 </template>
 
 <script setup>
-import CardPile from './CardPile.vue'
-import Controls from './Controls.vue'
+import CardPile    from './CardPile.vue'
+import Controls    from './Controls.vue'
 import PlayerPanel from './PlayerPanel.vue'
+import { useI18n } from '../composables/useI18n.js'
+
+const { t } = useI18n()
 
 defineProps({
-  players:            { type: Array, required: true },
-  deck:               { type: Array, required: true },
-  currentCard:        { type: Number, required: true },
-  tokensOnCard:       { type: Number, required: true },
-  currentPlayerIndex: { type: Number, required: true },
-  currentPlayer:      { type: Object, required: true },
-  lastAction:         { type: Object, default: null },
-  cardAnimKey:        { type: Number, default: 0 },
+  players:            { type: Array,   required: true },
+  deck:               { type: Array,   required: true },
+  currentCard:        { type: Number,  required: true },
+  tokensOnCard:       { type: Number,  required: true },
+  currentPlayerIndex: { type: Number,  required: true },
+  currentPlayer:      { type: Object,  required: true },
+  lastAction:         { type: Object,  default: null },
+  cardAnimKey:        { type: Number,  default: 0 },
   noTokenShake:       { type: Boolean, default: false },
-  liveScores:         { type: Array, default: () => [] },
+  liveScores:         { type: Array,   default: () => [] },
+  // Timer (transmis depuis App via useTimer)
+  timerEnabled:       { type: Boolean, default: false },
+  remaining:          { type: Number,  default: 0 },
+  progress:           { type: Number,  default: 1 },
+  urgency:            { type: String,  default: 'safe' },
 })
 
 defineEmits(['take', 'refuse', 'quit'])
 </script>
 
 <style scoped>
-.action-toast-enter-active,
-.action-toast-leave-active {
-  transition: all 0.3s ease;
-}
-.action-toast-enter-from {
-  opacity: 0;
-  transform: translateY(-8px) scale(0.97);
-}
-.action-toast-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
-}
+.action-toast-enter-active, .action-toast-leave-active { transition: all 0.3s ease; }
+.action-toast-enter-from { opacity: 0; transform: translateY(-8px) scale(0.97); }
+.action-toast-leave-to   { opacity: 0; transform: translateY(-4px); }
 </style>
