@@ -112,6 +112,22 @@
             </span>
           </div>
 
+          <!-- Timer réseau -->
+          <div v-if="timerEnabled && timerRemaining !== null" class="w-full max-w-xs flex flex-col items-center gap-1.5">
+            <div class="w-full h-2 rounded-full bg-felt-dark/60 overflow-hidden border border-token-gold/10">
+              <div class="h-full rounded-full transition-all duration-1000 ease-linear"
+                :class="{ 'bg-green-500': timerUrgency==='safe', 'bg-orange-400': timerUrgency==='warn', 'bg-red-500 animate-pulse': timerUrgency==='danger' }"
+                :style="{ width: (timerProgress * 100) + '%' }" />
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-felt-light">{{ t('controls.timer_label') }}</span>
+              <span class="font-mono text-sm font-bold"
+                :class="{ 'text-green-400': timerUrgency==='safe', 'text-orange-400': timerUrgency==='warn', 'text-red-400': timerUrgency==='danger' }">
+                {{ timerRemaining }}s
+              </span>
+            </div>
+          </div>
+
           <!-- Erreur d'action -->
           <Transition name="error-fade">
             <div v-if="actionError" class="text-red-400 text-sm text-center bg-red-900/20 border border-red-500/30 rounded-lg px-4 py-2">
@@ -259,6 +275,11 @@ defineProps({
   noTokenShake:       { type: Boolean, default: false },
   actionError:        { type: Object,  default: null },
   notification:       { type: Object,  default: null },
+  // Timer (géré côté serveur)
+  timerEnabled:       { type: Boolean, default: false },
+  timerRemaining:     { type: Number,  default: null },
+  timerProgress:      { type: Number,  default: 1 },
+  timerUrgency:       { type: String,  default: 'safe' },
 })
 
 defineEmits(['take', 'refuse', 'leave'])

@@ -1,15 +1,6 @@
 /**
- * server/index.js — Serveur Socket.IO pour "No Thanks!" multijoueur
- *
- * Architecture :
- *  - Express sert le frontend buildé (dist/)
- *  - Socket.IO gère la communication temps réel
- *  - Les parties sont stockées en mémoire (Map rooms)
- *  - Toute la logique de jeu est dans gameLogic.js
- *
- * Lancement : node server/index.js
- * Accès local : http://localhost:3000
- * Accès réseau : http://<IP_LOCALE>:3000
+ * server/index.cjs — Serveur Socket.IO "No Thanks!" v2
+ * Nouveautés : timer côté serveur, mode spectateur, options de partie
  */
 
 const express    = require('express')
@@ -17,356 +8,304 @@ const http       = require('http')
 const { Server } = require('socket.io')
 const path       = require('path')
 const {
-  createRoom, addPlayer, startGame,
+  createRoom, addPlayer, setRoomOptions, startGame,
   takeCard, refuseCard,
   handleDisconnect, handleReconnect,
-  getPublicState, getFinalRanking,
+  getPublicState, getFinalRanking, getTimerRemaining,
   MIN_PLAYERS, MAX_PLAYERS,
 } = require('./gameLogic.cjs')
 
-// ─── Configuration ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000
-
 const app    = express()
 const server = http.createServer(app)
-const io     = new Server(server, {
-  cors: {
-    // En développement on accepte toutes les origines
-    // En production, restreindre à votre domaine
-    origin: '*',
-    methods: ['GET', 'POST'],
-  },
-})
+const io     = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } })
 
-// ─── Servir le frontend ────────────────────────────────────────────────────────
-// En production : npm run build dans /src → fichiers dans /dist
+// Servir le frontend buildé
 const distPath = path.join(__dirname, '..', 'dist')
 app.use(express.static(distPath))
-app.get('*', (req, res) => {
-  res.sendFile(path.join(distPath, 'index.html'))
-})
+app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')))
 
-// ─── État global : toutes les parties actives ─────────────────────────────────
-/**
- * Map<roomCode, GameState>
- * Toutes les parties vivent ici, en mémoire.
- * Pas de base de données pour cette version.
- */
-const rooms = new Map()
-
-/**
- * Map<socketId, { roomCode, playerName }>
- * Permet de retrouver la partie d'un joueur en cas de déconnexion.
- */
-const socketToRoom = new Map()
+// ─── État global ───────────────────────────────────────────────────────────────
+const rooms       = new Map()   // Map<code, GameState>
+const socketToRoom = new Map()  // Map<socketId, { roomCode, playerName, isSpectator }>
+const roomTimers  = new Map()   // Map<code, intervalId> — timers serveur actifs
 
 // ─── Utilitaires ──────────────────────────────────────────────────────────────
 
-/** Génère un code de partie de 4 lettres majuscules unique. */
 function generateRoomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // sans I, O, 0, 1 (ambigus)
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
   let code
-  do {
-    code = Array.from({ length: 4 }, () =>
-      chars[Math.floor(Math.random() * chars.length)]
-    ).join('')
-  } while (rooms.has(code))
+  do { code = Array.from({length:4}, () => chars[Math.floor(Math.random()*chars.length)]).join('') }
+  while (rooms.has(code))
   return code
 }
 
-/** Envoie l'état complet de la partie à tous les joueurs de la room. */
+/** Diffuse l'état à TOUS (joueurs + spectateurs) dans la room Socket.IO. */
 function broadcastState(room) {
-  const state = getPublicState(room)
-  io.to(room.code).emit('game:state', state)
+  io.to(room.code).emit('game:state', getPublicState(room))
 }
 
-/** Envoie un message d'erreur au seul client concerné. */
 function sendError(socket, code, message) {
   socket.emit('error:action', { code, message })
 }
 
-/** Nettoie les parties terminées ou vides depuis plus de 10 minutes. */
+// ─── Timer serveur ─────────────────────────────────────────────────────────────
+/**
+ * Démarre un intervalle toutes les secondes pour la room.
+ * Chaque seconde : broadcast le temps restant.
+ * À 0 : force takeCard pour le joueur courant.
+ */
+function startRoomTimer(room) {
+  stopRoomTimer(room.code) // sécurité : on n'en veut qu'un seul
+
+  const intervalId = setInterval(() => {
+    if (room.phase !== 'playing' || !room.timerEnabled) {
+      stopRoomTimer(room.code); return
+    }
+
+    const remaining = getTimerRemaining(room)
+
+    // Broadcast ticker toutes les secondes à la room
+    io.to(room.code).emit('game:timer', { remaining })
+
+    // Temps écoulé → force la prise de carte
+    if (remaining <= 0) {
+      const player = room.players[room.currentPlayerIndex]
+      if (player?.connected) {
+        const result = takeCard(room, player.socketId)
+        if (result.ok) {
+          console.log(`[timer] Temps écoulé — ${player.name} force-take dans ${room.code}`)
+          broadcastState(room)
+          if (room.phase === 'finished') {
+            io.to(room.code).emit('game:finished', { ranking: getFinalRanking(room) })
+            stopRoomTimer(room.code)
+          } else {
+            // Redémarrer le timer pour le prochain joueur
+            startRoomTimer(room)
+          }
+        }
+      }
+    }
+  }, 1000)
+
+  roomTimers.set(room.code, intervalId)
+}
+
+function stopRoomTimer(roomCode) {
+  const id = roomTimers.get(roomCode)
+  if (id) { clearInterval(id); roomTimers.delete(roomCode) }
+}
+
+// ─── Nettoyage ─────────────────────────────────────────────────────────────────
 function cleanupOldRooms() {
   const TEN_MIN = 10 * 60 * 1000
   const now = Date.now()
   for (const [code, room] of rooms) {
-    const isOld = (now - room.createdAt) > TEN_MIN
     const isEmpty = room.players.filter(p => p.connected).length === 0
+    const isOld   = (now - room.createdAt) > TEN_MIN
     if (isOld || (isEmpty && room.phase !== 'lobby')) {
+      stopRoomTimer(code)
       rooms.delete(code)
       console.log(`[cleanup] Room ${code} supprimée`)
     }
   }
 }
-setInterval(cleanupOldRooms, 5 * 60 * 1000) // toutes les 5 minutes
+setInterval(cleanupOldRooms, 5 * 60 * 1000)
 
-// ─── Gestion des connexions Socket.IO ────────────────────────────────────────
-
+// ─── Connexions Socket.IO ──────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log(`[connect] ${socket.id}`)
 
-  // ── CRÉER UNE PARTIE ──────────────────────────────────────────────────────
-  /**
-   * Événement : 'room:create'
-   * Payload  : { playerName: string }
-   * Réponse  : 'room:created' { roomCode, state } | 'error:action'
-   */
+  // ── CRÉER UNE PARTIE ────────────────────────────────────────────────────────
   socket.on('room:create', ({ playerName } = {}) => {
-    if (!playerName?.trim()) {
-      return sendError(socket, 'invalid_name', 'Nom de joueur requis')
-    }
-
+    if (!playerName?.trim()) return sendError(socket, 'invalid_name', 'Nom requis')
     const code = generateRoomCode()
     const room = createRoom(code, socket.id)
     rooms.set(code, room)
-
-    // Ajouter l'hôte comme premier joueur
     const result = addPlayer(room, socket.id, playerName)
-    if (!result.ok) {
-      rooms.delete(code)
-      return sendError(socket, result.error, 'Impossible de créer la partie')
-    }
-
-    // Rejoindre la room Socket.IO
+    if (!result.ok) { rooms.delete(code); return sendError(socket, result.error, 'Impossible de créer') }
     socket.join(code)
-    socketToRoom.set(socket.id, { roomCode: code, playerName: playerName.trim() })
-
-    console.log(`[room:create] ${code} par ${playerName} (${socket.id})`)
-
-    socket.emit('room:created', {
-      roomCode: code,
-      isHost:   true,
-      state:    getPublicState(room),
-    })
+    socketToRoom.set(socket.id, { roomCode: code, playerName: playerName.trim(), isSpectator: false })
+    console.log(`[room:create] ${code} par ${playerName}`)
+    socket.emit('room:created', { roomCode: code, isHost: true, state: getPublicState(room) })
   })
 
-  // ── REJOINDRE UNE PARTIE ─────────────────────────────────────────────────
-  /**
-   * Événement : 'room:join'
-   * Payload  : { roomCode: string, playerName: string }
-   * Réponse  : 'room:joined' { state } | 'error:action'
-   */
+  // ── CONFIGURER LA PARTIE (hôte, avant démarrage) ────────────────────────────
+  // Payload : { timerEnabled: bool, timerDuration: number }
+  socket.on('room:options', (options = {}) => {
+    const meta = socketToRoom.get(socket.id)
+    if (!meta) return
+    const room = rooms.get(meta.roomCode)
+    if (!room) return
+    const result = setRoomOptions(room, socket.id, options)
+    if (!result.ok) return sendError(socket, result.error, 'Impossible de configurer')
+    // Diffuser les nouvelles options à tous (notamment les spectateurs)
+    broadcastState(room)
+  })
+
+  // ── REJOINDRE UNE PARTIE (joueur) ────────────────────────────────────────────
   socket.on('room:join', ({ roomCode, playerName } = {}) => {
     const code = roomCode?.trim().toUpperCase()
-    if (!code || !playerName?.trim()) {
-      return sendError(socket, 'invalid_payload', 'Code et nom requis')
-    }
-
+    if (!code || !playerName?.trim()) return sendError(socket, 'invalid_payload', 'Code et nom requis')
     const room = rooms.get(code)
-    if (!room) {
-      return sendError(socket, 'room_not_found', `Aucune partie avec le code ${code}`)
-    }
+    if (!room) return sendError(socket, 'room_not_found', `Aucune partie avec le code ${code}`)
 
-    // Tentative de reconnexion : même nom dans la même partie
-    const existingPlayer = room.players.find(
-      p => p.name.toLowerCase() === playerName.trim().toLowerCase()
-    )
-    if (existingPlayer && !existingPlayer.connected) {
-      const reconnect = handleReconnect(room, existingPlayer.socketId, socket.id)
+    // Tentative de reconnexion
+    const existing = room.players.find(p => p.name.toLowerCase() === playerName.trim().toLowerCase())
+    if (existing && !existing.connected) {
+      const reconnect = handleReconnect(room, existing.socketId, socket.id)
       if (reconnect.ok) {
-        socketToRoom.set(socket.id, { roomCode: code, playerName: playerName.trim() })
+        socketToRoom.set(socket.id, { roomCode: code, playerName: playerName.trim(), isSpectator: false })
         socket.join(code)
-
-        console.log(`[room:rejoin] ${playerName} reconnecté dans ${code}`)
-        socket.emit('room:joined', {
-          roomCode: code,
-          isHost:   room.host === socket.id,
-          state:    getPublicState(room),
-          reconnected: true,
-        })
+        socket.emit('room:joined', { roomCode: code, isHost: room.host === socket.id, state: getPublicState(room), reconnected: true })
         broadcastState(room)
-        io.to(code).emit('game:notification', {
-          type:    'reconnect',
-          message: `${playerName} s'est reconnecté`,
-        })
+        io.to(code).emit('game:notification', { type: 'reconnect', message: `${playerName} s'est reconnecté` })
         return
       }
     }
 
     const result = addPlayer(room, socket.id, playerName)
     if (!result.ok) {
-      const messages = {
-        game_already_started: 'La partie a déjà commencé',
-        room_full:            'La partie est complète (7 joueurs max)',
-        name_taken:           'Ce nom est déjà utilisé',
-      }
-      return sendError(socket, result.error, messages[result.error] || 'Impossible de rejoindre')
+      const msgs = { game_already_started:'La partie a déjà commencé', room_full:'Partie complète (7 max)', name_taken:'Nom déjà utilisé' }
+      return sendError(socket, result.error, msgs[result.error] || 'Impossible de rejoindre')
     }
+    socket.join(code)
+    socketToRoom.set(socket.id, { roomCode: code, playerName: playerName.trim(), isSpectator: false })
+    socket.emit('room:joined', { roomCode: code, isHost: false, state: getPublicState(room) })
+    socket.to(code).emit('game:notification', { type: 'join', message: `${playerName.trim()} a rejoint` })
+    broadcastState(room)
+  })
+
+  // ── REJOINDRE EN SPECTATEUR ─────────────────────────────────────────────────
+  /**
+   * Événement : 'room:spectate'
+   * Payload  : { roomCode: string }
+   * Le spectateur reçoit l'état complet immédiatement + tous les broadcasts suivants.
+   * Il ne peut PAS jouer.
+   */
+  socket.on('room:spectate', ({ roomCode } = {}) => {
+    const code = roomCode?.trim().toUpperCase()
+    if (!code) return sendError(socket, 'invalid_payload', 'Code requis')
+    const room = rooms.get(code)
+    if (!room) return sendError(socket, 'room_not_found', `Aucune partie avec le code ${code}`)
 
     socket.join(code)
-    socketToRoom.set(socket.id, { roomCode: code, playerName: playerName.trim() })
+    socketToRoom.set(socket.id, { roomCode: code, playerName: '👁 Spectateur', isSpectator: true })
+    console.log(`[spectate] ${socket.id} regarde ${code}`)
 
-    console.log(`[room:join] ${playerName} rejoint ${code}`)
-
-    socket.emit('room:joined', {
+    socket.emit('room:spectating', {
       roomCode: code,
-      isHost:   false,
       state:    getPublicState(room),
+      // Si la partie est déjà terminée, envoyer aussi le classement
+      ranking:  room.phase === 'finished' ? getFinalRanking(room) : null,
     })
-
-    // Notifier tous les autres joueurs
-    socket.to(code).emit('game:notification', {
-      type:    'join',
-      message: `${playerName.trim()} a rejoint la partie`,
-    })
-    broadcastState(room)
   })
 
-  // ── DÉMARRER LA PARTIE (hôte seulement) ──────────────────────────────────
-  /**
-   * Événement : 'room:start'
-   * Payload  : {} (pas de payload nécessaire)
-   * Réponse  : broadcast 'game:state' à tous | 'error:action'
-   */
+  // ── DÉMARRER LA PARTIE ──────────────────────────────────────────────────────
   socket.on('room:start', () => {
     const meta = socketToRoom.get(socket.id)
-    if (!meta) return sendError(socket, 'not_in_room', 'Vous n\'êtes pas dans une partie')
-
+    if (!meta || meta.isSpectator) return sendError(socket, 'not_allowed', 'Action non autorisée')
     const room = rooms.get(meta.roomCode)
     if (!room) return sendError(socket, 'room_not_found', 'Partie introuvable')
-
     const result = startGame(room, socket.id)
     if (!result.ok) {
-      const messages = {
-        not_host:             'Seul l\'hôte peut démarrer la partie',
-        wrong_phase:          'La partie n\'est pas en phase lobby',
-        not_enough_players:   `Il faut au moins ${MIN_PLAYERS} joueurs`,
-      }
-      return sendError(socket, result.error, messages[result.error] || 'Impossible de démarrer')
+      const msgs = { not_host: 'Seul l\'hôte peut démarrer', wrong_phase: 'Phase incorrecte', not_enough_players: `Minimum ${MIN_PLAYERS} joueurs` }
+      return sendError(socket, result.error, msgs[result.error] || 'Impossible de démarrer')
     }
-
-    console.log(`[room:start] ${meta.roomCode} — ${room.players.length} joueurs`)
+    console.log(`[room:start] ${meta.roomCode} — ${room.players.length} joueurs, timer: ${room.timerEnabled ? room.timerDuration+'s' : 'off'}`)
     broadcastState(room)
+    // Démarrer le timer serveur si activé
+    if (room.timerEnabled) startRoomTimer(room)
   })
 
-  // ── PRENDRE LA CARTE ──────────────────────────────────────────────────────
-  /**
-   * Événement : 'game:take'
-   * Validation : seul le joueur dont c'est le tour peut jouer
-   */
+  // ── PRENDRE LA CARTE ────────────────────────────────────────────────────────
   socket.on('game:take', () => {
     const meta = socketToRoom.get(socket.id)
-    if (!meta) return
-
+    if (!meta || meta.isSpectator) return
     const room = rooms.get(meta.roomCode)
     if (!room) return
-
     const result = takeCard(room, socket.id)
     if (!result.ok) {
-      const messages = {
-        not_your_turn: 'Ce n\'est pas votre tour',
-        wrong_phase:   'La partie n\'est pas en cours',
-        no_tokens:     'Vous n\'avez plus de jetons',
-      }
-      return sendError(socket, result.error, messages[result.error] || 'Action invalide')
+      const msgs = { not_your_turn:'Ce n\'est pas votre tour', wrong_phase:'Partie non démarrée', no_tokens:'Plus de jetons' }
+      return sendError(socket, result.error, msgs[result.error] || 'Action invalide')
     }
-
     console.log(`[game:take] ${meta.playerName} prend ${result.action.card} dans ${meta.roomCode}`)
-
-    // Diffuser le nouvel état à tous
     broadcastState(room)
-
-    // Si la partie est terminée, envoyer aussi le classement
     if (room.phase === 'finished') {
-      io.to(room.code).emit('game:finished', {
-        ranking: getFinalRanking(room),
-      })
+      stopRoomTimer(meta.roomCode)
+      io.to(room.code).emit('game:finished', { ranking: getFinalRanking(room) })
+    } else if (room.timerEnabled) {
+      // Redémarrer le timer pour le nouveau joueur
+      startRoomTimer(room)
     }
   })
 
-  // ── REFUSER LA CARTE ──────────────────────────────────────────────────────
-  /**
-   * Événement : 'game:refuse'
-   */
+  // ── REFUSER LA CARTE ────────────────────────────────────────────────────────
   socket.on('game:refuse', () => {
     const meta = socketToRoom.get(socket.id)
-    if (!meta) return
-
+    if (!meta || meta.isSpectator) return
     const room = rooms.get(meta.roomCode)
     if (!room) return
-
     const result = refuseCard(room, socket.id)
     if (!result.ok) {
-      const messages = {
-        not_your_turn: 'Ce n\'est pas votre tour',
-        wrong_phase:   'La partie n\'est pas en cours',
-        no_tokens:     'Vous n\'avez plus de jetons — vous devez prendre la carte !',
-      }
-      return sendError(socket, result.error, messages[result.error] || 'Action invalide')
+      const msgs = { not_your_turn:'Ce n\'est pas votre tour', wrong_phase:'Partie non démarrée', no_tokens:'Plus de jetons — vous devez prendre !' }
+      return sendError(socket, result.error, msgs[result.error] || 'Action invalide')
     }
-
     console.log(`[game:refuse] ${meta.playerName} refuse dans ${meta.roomCode}`)
     broadcastState(room)
+    if (room.timerEnabled) startRoomTimer(room)
   })
 
-  // ── DÉCONNEXION ───────────────────────────────────────────────────────────
+  // ── DÉCONNEXION ─────────────────────────────────────────────────────────────
   socket.on('disconnect', (reason) => {
     console.log(`[disconnect] ${socket.id} — ${reason}`)
-
     const meta = socketToRoom.get(socket.id)
     if (!meta) return
-
     const room = rooms.get(meta.roomCode)
-    if (!room) { socketToRoom.delete(socket.id); return }
+    socketToRoom.delete(socket.id)
+    if (!room) return
+
+    // Les spectateurs se déconnectent silencieusement
+    if (meta.isSpectator) return
 
     const result = handleDisconnect(room, socket.id)
-    socketToRoom.delete(socket.id)
-
     if (!result.removed) return
 
-    // Notifier les autres joueurs
-    io.to(meta.roomCode).emit('game:notification', {
-      type:    'disconnect',
-      message: `${meta.playerName} s'est déconnecté`,
-    })
+    io.to(meta.roomCode).emit('game:notification', { type: 'disconnect', message: `${meta.playerName} s'est déconnecté` })
 
-    // Si la room est vide, la supprimer
     if (result.isEmpty) {
+      stopRoomTimer(meta.roomCode)
       rooms.delete(meta.roomCode)
-      console.log(`[cleanup] Room ${meta.roomCode} vide, supprimée`)
+      console.log(`[cleanup] Room ${meta.roomCode} vide`)
       return
     }
-
-    // Sinon, diffuser l'état mis à jour (avec le joueur marqué déconnecté)
     broadcastState(room)
-
-    // Si l'hôte change, notifier
     if (result.isHost) {
-      io.to(meta.roomCode).emit('game:notification', {
-        type:    'new_host',
-        message: `Nouvel hôte : ${room.players.find(p => p.socketId === result.newHostId)?.name}`,
-      })
+      const newHost = room.players.find(p => p.socketId === result.newHostId)
+      io.to(meta.roomCode).emit('game:notification', { type: 'new_host', message: `Nouvel hôte : ${newHost?.name}` })
     }
+    // Redémarrer le timer si c'était le tour du joueur déconnecté
+    if (room.timerEnabled && room.phase === 'playing') startRoomTimer(room)
   })
 
-  // ── PING / STATUT (debug) ─────────────────────────────────────────────────
   socket.on('ping:server', (cb) => {
     if (typeof cb === 'function') cb({ time: Date.now(), rooms: rooms.size })
   })
 })
 
-// ─── Lancement du serveur ─────────────────────────────────────────────────────
+// ─── Lancement ─────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
-  // Afficher l'IP locale pour faciliter la connexion réseau
   const { networkInterfaces } = require('os')
-  const nets = networkInterfaces()
   const localIPs = []
-
-  for (const iface of Object.values(nets)) {
+  for (const iface of Object.values(networkInterfaces())) {
     for (const net of iface) {
-      if (net.family === 'IPv4' && !net.internal) {
-        localIPs.push(net.address)
-      }
+      if (net.family === 'IPv4' && !net.internal) localIPs.push(net.address)
     }
   }
-
-  console.log('\n🎴  No Thanks! — Serveur multijoueur')
-  console.log('━'.repeat(40))
+  console.log('\n🎴  No Thanks! — Serveur multijoueur v2')
+  console.log('━'.repeat(45))
   console.log(`   Local   : http://localhost:${PORT}`)
-  localIPs.forEach(ip => {
-    console.log(`   Réseau  : http://${ip}:${PORT}`)
-  })
-  console.log('━'.repeat(40))
-  console.log('   Les autres joueurs accèdent via l\'IP réseau.')
-  console.log('   Ctrl+C pour arrêter.\n')
+  localIPs.forEach(ip => console.log(`   Réseau  : http://${ip}:${PORT}`))
+  console.log(`   Spectat : http://<IP>:${PORT}/#spectate`)
+  console.log('━'.repeat(45) + '\n')
 })
